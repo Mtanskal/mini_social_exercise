@@ -49,6 +49,7 @@
                         <th>Profile Bio</th>
                         <th>Created At</th>
                         <th>Risk Level</th>
+                        <th>Account Ban Status</th>
                         <th>Actions</th>
                     </tr>
                 </thead>
@@ -70,6 +71,13 @@
                                 <span class="badge bg-secondary">NONE</span>
                             {% endif %}
                             <span class="ms-2">({{ user.risk_score }})</span>
+                        </td>
+                        <td>
+                            {% if user.shadow_banned == 1 %}
+                                <span class="badge bg-danger">Banned</span>
+                            {% else %}
+                                <span class="badge bg-success">Not banned</span>
+                            {% endif %}
                         </td>
                         <td>
                             <form action="{{ url_for('admin_delete_user', user_id=user.id) }}" method="POST" onsubmit="return confirm('WARNING: Deleting a user will also delete ALL their posts, comments, and reactions. This cannot be undone. Are you sure?');">

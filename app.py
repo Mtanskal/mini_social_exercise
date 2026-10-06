@@ -6,7 +6,7 @@ import json
 import sqlite3
 import hashlib
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = '123456789' 
@@ -211,11 +211,38 @@ def add_post():
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
 
+    # Get the shadow_banned status
+    db = get_db()
+    user = db.execute(
+        'SELECT shadow_banned FROM users WHERE id = ?',
+        (user_id,)
+    ).fetchone()
+
+    # If account is banned, prevent the posting but disguise the ban by showing success message
+    if user and user['shadow_banned'] == 1:
+        flash('Your post was successfully created!', 'success')
+        return redirect(url_for('feed'))  
+
     # Get content from the submitted form
     content = request.form.get('content')
 
     # Pass the user's content through the moderation function
-    moderated_content = content
+    moderated_content, _ = moderate_content(content)
+
+    # Check if the post is marked by spam/scam policy
+    if moderated_content == "content removed due to spam/scam policy":
+        db = get_db()
+        db.execute(
+            # Update shadow_banned status
+            'UPDATE users SET shadow_banned = 1 WHERE id = ?',
+            (user_id,)
+        )
+        db.commit()
+
+        # If account is now banned, prevent the posting but disguise the ban by showing success message
+        flash('Your post was successfully created!', 'success')
+
+        return redirect(url_for('feed'))
 
     # Basic validation to ensure post is not empty
     if moderated_content and moderated_content.strip():
@@ -489,8 +516,38 @@ def add_comment(post_id):
         flash('You must be logged in to comment.', 'danger')
         return redirect(url_for('login'))
 
+    # Get the shadow_banned status
+    db = get_db()
+    user = db.execute(
+        'SELECT shadow_banned FROM users WHERE id = ?',
+        (user_id,)
+    ).fetchone()
+
+    # If account is banned, prevent commenting but disguise the ban by showing success message
+    if user and user['shadow_banned'] == 1:
+        flash('Your comment was added.', 'success')
+        return redirect(request.referrer or url_for('post_detail', post_id=post_id))
+
     # Get content from the submitted form
     content = request.form.get('content')
+
+    # Pass the user's content through the moderation function
+    moderated_content, _ = moderate_content(content)
+
+    # Check if the comment is marked by spam/scam policy
+    if moderated_content == "content removed due to spam/scam policy":
+        db = get_db()
+        db.execute(
+            # Update shadow_banned status
+            'UPDATE users SET shadow_banned = 1 WHERE id = ?',
+            (user_id,)
+        )
+        db.commit()
+
+        # If account is banned, prevent commenting but disguise the ban by showing success message
+        flash('Your comment was added.', 'success')
+
+        return redirect(request.referrer or url_for('post_detail', post_id=post_id))
 
     # Basic validation to ensure comment is not empty
     if content and content.strip():
@@ -708,7 +765,7 @@ def admin_dashboard():
     
     # First, get all users to calculate risk, then apply pagination in Python
     # It's more complex to do this efficiently in SQL if risk calc is Python-side
-    all_users_raw = query_db('SELECT id, username, profile, created_at FROM users')
+    all_users_raw = query_db('SELECT id, username, profile, created_at, shadow_banned FROM users')
     all_users = []
     for user in all_users_raw:
         user_dict = dict(user)
@@ -883,10 +940,87 @@ def user_risk_analysis(user_id):
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-    
-    score = 0
 
-    return score;
+    #Profile score
+    profile = dict(query_db('SELECT * FROM users WHERE id = ?', (user_id,), one=True))
+    if profile is None:
+        profile_score = 0
+    else:
+        _, profile_score = moderate_content(profile.get('profile', ''))
+
+    # All of the user's posts
+    posts_raw =  query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    all_posts_score = 0
+    post_count = 0
+    shadow_ban_status = 0
+    # If there are no posts
+    if len(posts_raw) == 0:
+        average_post_score = 0
+    else:
+        for post in posts_raw:
+            # Examining every post
+            post_dict = dict(post)
+            # Get score and moderated content
+            moderated_post, post_score = moderate_content(post_dict['content'])
+            all_posts_score += post_score
+            post_count = post_count + 1
+            if moderated_post == "content removed due to spam/scam policy":
+                # Set ban status for user
+                shadow_ban_status = 1
+
+        average_post_score = all_posts_score/post_count
+
+    # All of the comments
+    comments_raw = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    all_comments_score = 0
+    comments_count = 0
+    # If there are no comments
+    if len(comments_raw) == 0:
+        average_comment_score = 0
+    else:
+        for comment in comments_raw:
+            # Examining every comment
+            comment_dict = dict(comment)
+            # Get score and moderated content
+            moderated_comment, comment_score = moderate_content(comment_dict['content'])
+            all_comments_score += comment_score
+            comments_count = comments_count + 1
+            if moderated_comment == "content removed due to spam/scam policy":
+                # Set ban status for user
+                shadow_ban_status = 1
+
+        average_comment_score = all_comments_score/comments_count
+
+    # Calculate the content risk score 
+    content_risk_score = (profile_score * 1) + (average_post_score * 3) + (average_comment_score * 1)
+
+    account_created = dict(query_db('SELECT created_at FROM users WHERE id = ?', (user_id,), one=True))
+    account_age = datetime.now() - account_created['created_at']
+
+    # Apply the age multiplier
+    if account_age < timedelta(days=7):
+        content_risk_score = content_risk_score * 1.5
+    elif account_age < timedelta(days=20):
+        content_risk_score = content_risk_score * 1.2
+    else:
+        content_risk_score = content_risk_score * 1
+
+    # Cap the user risk score to 5
+    if content_risk_score <= 5:
+        final_user_risk_score = content_risk_score
+    else:
+        final_user_risk_score = 5.0
+
+    # Update the shadow_banned status in database if needed based on the user's comments and posts
+    if shadow_ban_status == 1:
+        db = get_db()
+        db.execute(
+            'UPDATE users SET shadow_banned = 1 WHERE id = ?',
+            (user_id,)
+        )
+        db.commit()
+
+    return final_user_risk_score
 
     
 # Assignment 2.1
@@ -906,10 +1040,67 @@ def moderate_content(content):
             password: admin
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-
+    original_content = content
     moderated_content = content
-    score = 0
+    score = 0 
+
+    # Check if there is content to be moderated
+    if content is None:
+        return moderated_content, score
     
+    content_splitted = content.split()
+    number_of_alphabetic_characters = 0
+    number_of_uppercase_characters = 0
+    i = 0
+    while i < len(content_splitted):
+        if content_splitted[i].lower() in TIER1_WORDS:
+            # If the word is found from TIER1_WORDS list
+            moderated_content = "content removed due to severe violation"
+            score = 5.0
+            return moderated_content, score
+        elif content_splitted[i].lower() in TIER2_PHRASES:
+            # If the word is found from TIER2_WORDS list
+            moderated_content = "content removed due to spam/scam policy"
+            score = 5.0
+            return moderated_content, score
+        elif content_splitted[i].lower() in TIER3_WORDS:
+            # If the word is found from TIER3_WORDS list
+            score += 2
+            x = 1
+            moderated_content = "*"
+            # Replaces the word with asterisks (*) equal to its lenght
+            while x < len(content_splitted[i]):
+                moderated_content += "*"
+                x += 1
+            original_content = original_content.replace(content_splitted[i], moderated_content)
+            i += 1
+        elif content_splitted[i].lower().find("[.]") != -1 or content_splitted[i].lower().find("/") != -1:
+            # If the word is a link
+            score += 2
+            original_content = original_content.replace(content_splitted[i], "link removed")
+            i += 1
+        else:
+            x = 0
+            # The selected word from content
+            selected_word = content_splitted[i]
+            # While loop where the number of alphabetical characters and uppercase alphabetical charaters are counted
+            while x < len(content_splitted[i]):
+                if selected_word[x].isupper() and selected_word[x].isalpha():
+                    # If the character is uppercase and alphabetical
+                    number_of_uppercase_characters += 1
+                    number_of_alphabetic_characters += 1
+                elif selected_word[x].isalpha():
+                    # If the character is alphabetical
+                    number_of_alphabetic_characters += 1
+                x += 1
+            i += 1
+
+    # Check for excessove capitalization
+    if (number_of_alphabetic_characters > 15) and ((number_of_uppercase_characters/number_of_alphabetic_characters) > 0.7):
+        score += 0.5
+        
+    moderated_content = original_content
+
     return moderated_content, score
 
 # Coding Assignment #3

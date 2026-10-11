@@ -113,9 +113,11 @@ def feed():
     params = []
 
     #  2. Build the Query 
-    where_clause = ""
+    where_clause = "WHERE (u.shadow_banned = 0 OR p.user_id = ?)"
+    params.append(current_user_id)
+
     if show == 'following' and current_user_id:
-        where_clause = "WHERE p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        where_clause += " AND p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
         params.append(current_user_id)
 
     # Add the pagination parameters to the query arguments
@@ -175,7 +177,14 @@ def feed():
                 user_reaction = reaction_check['reaction_type']
 
         reactions = query_db('SELECT reaction_type, COUNT(*) as count FROM reactions WHERE post_id = ? GROUP BY reaction_type', (post['id'],))
-        comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post['id'],))
+        comments_raw = query_db('''
+            SELECT c.id, c.content, c.created_at, u.username, u.id as user_id
+            FROM comments c
+            JOIN users u ON c.user_id = u.id
+            WHERE c.post_id = ?
+            AND (u.shadow_banned = 0 OR c.user_id = ?)
+            ORDER BY c.created_at ASC
+        ''', (post['id'], current_user_id))
         post_dict = dict(post)
         post_dict['content'], _ = moderate_content(post_dict['content'])
         comments_moderated = []
@@ -211,18 +220,6 @@ def add_post():
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
 
-    # Get the shadow_banned status
-    db = get_db()
-    user = db.execute(
-        'SELECT shadow_banned FROM users WHERE id = ?',
-        (user_id,)
-    ).fetchone()
-
-    # If account is banned, prevent the posting but disguise the ban by showing success message
-    if user and user['shadow_banned'] == 1:
-        flash('Your post was successfully created!', 'success')
-        return redirect(url_for('feed'))  
-
     # Get content from the submitted form
     content = request.form.get('content')
 
@@ -238,11 +235,6 @@ def add_post():
             (user_id,)
         )
         db.commit()
-
-        # If account is now banned, prevent the posting but disguise the ban by showing success message
-        flash('Your post was successfully created!', 'success')
-
-        return redirect(url_for('feed'))
 
     # Basic validation to ensure post is not empty
     if moderated_content and moderated_content.strip():
@@ -304,10 +296,18 @@ def user_profile(username):
         abort(404)
 
     user = dict(user_raw)
+    current_user_id = session.get('user_id')
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
 
-    posts_raw = query_db('SELECT id, content, user_id, created_at FROM posts WHERE user_id = ? ORDER BY created_at DESC', (user['id'],))
+    posts_raw = query_db('''
+        SELECT p.id, p.content, p.user_id, p.created_at
+        FROM posts p
+        JOIN users u ON u.id = p.user_id
+        WHERE p.user_id = ?
+        AND (u.shadow_banned = 0 OR p.user_id = ?)
+        ORDER BY p.created_at DESC
+    ''', (user['id'], current_user_id))
     posts = []
     for post_raw in posts_raw:
         post = dict(post_raw)
@@ -315,7 +315,15 @@ def user_profile(username):
         post['content'] = moderated_post_content
         posts.append(post)
 
-    comments_raw = query_db('SELECT id, content, user_id, post_id, created_at FROM comments WHERE user_id = ? ORDER BY created_at DESC LIMIT 100', (user['id'],))
+    comments_raw = query_db('''
+        SELECT c.id, c.content, c.user_id, c.post_id, c.created_at
+        FROM comments c
+        JOIN users u ON u.id = c.user_id
+        WHERE c.user_id = ?
+        AND (u.shadow_banned = 0 OR c.user_id = ?)
+        ORDER BY c.created_at DESC
+        LIMIT 100
+    ''', (user['id'], current_user_id))
     comments = []
     for comment_raw in comments_raw:
         comment = dict(comment_raw)
@@ -381,7 +389,7 @@ def post_detail(post_id):
     """Displays a single post and its comments, with content moderation applied."""
     
     post_raw = query_db('''
-        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id, u.shadow_banned
         FROM posts p
         JOIN users u ON p.user_id = u.id
         WHERE p.id = ?
@@ -390,7 +398,8 @@ def post_detail(post_id):
     if not post_raw:
         # The abort function will stop the request and show a 404 Not Found page.
         abort(404)
-
+    if (post_raw['shadow_banned'] == 1 and session.get('user_id') != post_raw['user_id']):
+        abort(404)
     #  Moderation for the Main Post 
     # Convert the raw database row to a mutable dictionary
     post = dict(post_raw)
@@ -407,7 +416,14 @@ def post_detail(post_id):
     ''', (post_id,))
 
     #  Fetch and Moderate Comments 
-    comments_raw = query_db('SELECT c.id, c.content, c.created_at, u.username, u.id as user_id FROM comments c JOIN users u ON c.user_id = u.id WHERE c.post_id = ? ORDER BY c.created_at ASC', (post_id,))
+    comments_raw = query_db('''
+        SELECT c.id, c.content, c.created_at, u.username, u.id as user_id
+        FROM comments c
+        JOIN users u ON c.user_id = u.id
+        WHERE c.post_id = ?
+        AND (u.shadow_banned = 0 OR c.user_id = ?)
+        ORDER BY c.created_at ASC
+    ''', (post_id, session.get('user_id')))
     
     comments = [] # Create a new list for the moderated comments
     for comment_raw in comments_raw:
@@ -516,18 +532,6 @@ def add_comment(post_id):
         flash('You must be logged in to comment.', 'danger')
         return redirect(url_for('login'))
 
-    # Get the shadow_banned status
-    db = get_db()
-    user = db.execute(
-        'SELECT shadow_banned FROM users WHERE id = ?',
-        (user_id,)
-    ).fetchone()
-
-    # If account is banned, prevent commenting but disguise the ban by showing success message
-    if user and user['shadow_banned'] == 1:
-        flash('Your comment was added.', 'success')
-        return redirect(request.referrer or url_for('post_detail', post_id=post_id))
-
     # Get content from the submitted form
     content = request.form.get('content')
 
@@ -543,11 +547,6 @@ def add_comment(post_id):
             (user_id,)
         )
         db.commit()
-
-        # If account is banned, prevent commenting but disguise the ban by showing success message
-        flash('Your comment was added.', 'success')
-
-        return redirect(request.referrer or url_for('post_detail', post_id=post_id))
 
     # Basic validation to ensure comment is not empty
     if content and content.strip():

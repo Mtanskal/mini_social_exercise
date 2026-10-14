@@ -25,6 +25,54 @@
       
       <p class="card-text mt-2">{{ post.content }}</p>
 
+      {% if session.get('user_id') == post.user_id %}
+        <hr>
+        <h5>Ask a particular user for help</h5>
+
+        {% if help_users %}
+        <form action="{{ url_for('ask_user_for_help', post_id=post.id) }}" method="POST">
+          <div class="mb-3">
+            <label for="recipient-{{ post.id }}" class="form-label">User</label>
+            <select class="form-select" id="recipient-{{ post.id }}"
+                    name="recipient_id" required>
+              <option value="">Choose a user</option>
+              {% for help_user in help_users %}
+              <option value="{{ help_user.id }}">{{ help_user.username }}</option>
+              {% endfor %}
+            </select>
+          </div>
+
+          <div class="mb-3">
+            <label for="question-{{ post.id }}" class="form-label">Question</label>
+            <textarea class="form-control" id="question-{{ post.id }}"
+                      name="question" rows="3" maxlength="1000" required></textarea>
+          </div>
+
+          <button type="submit" class="btn btn-primary">Send question</button>
+        </form>
+        {% else %}
+        <p class="text-muted">There are no other users to ask.</p>
+        {% endif %}
+      {% endif %}
+
+      {% if help_requests %}
+      <hr>
+      <h5>Questions about this post</h5>
+
+      {% for help_request in help_requests %}
+      <div class="card mb-2">
+        <div class="card-body">
+          <p class="mb-1">{{ help_request.question }}</p>
+          <small class="text-muted">
+            From {{ help_request.asker_username }}
+            to {{ help_request.recipient_username }}
+            · {{ help_request.created_at|datetimeformat }}
+          </small>
+        </div>
+      </div>
+      {% endfor %}
+      {% endif %}
+
       <!-- Reactions Display and Add Reaction Button (Copied from feed.html.j2) -->
       <div class="d-flex align-items-center mt-2 mb-2">
         <!-- Display existing reactions -->

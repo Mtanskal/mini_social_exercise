@@ -138,6 +138,43 @@ def feed():
         """
         final_params = params + list(pagination_params)
         posts = query_db(query, final_params)
+    elif sort == 'top_contributors':
+        # Top 5 all time contributors tab showed on the feed
+        top_users = query_db('''
+            SELECT
+                u.id,
+                10 * (SELECT COUNT(*) FROM posts p WHERE p.user_id = u.id) +
+                5 * (SELECT COUNT(*) FROM comments c WHERE c.user_id = u.id) AS points
+            FROM users u
+            WHERE u.shadow_banned = 0
+            ORDER BY points DESC, u.username ASC
+            LIMIT 5
+        ''')
+
+        top_user_ids = [user['id'] for user in top_users] # Get IDs of top 5 all time contributors
+
+        if top_user_ids:
+            # Select all the posts made by top 5 all time contributors from newest to oldest.
+            placeholders = ','.join('?' for _ in top_user_ids)
+
+            query = f'''
+                SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+                FROM posts p
+                JOIN users u ON p.user_id = u.id
+                {where_clause}
+                  AND p.user_id IN ({placeholders})
+                ORDER BY p.created_at DESC
+                LIMIT ? OFFSET ?
+            '''
+
+            final_params = (
+                params
+                + top_user_ids
+                + list(pagination_params)
+            )
+            posts = query_db(query, final_params)
+        else:
+            posts = []
     elif sort == 'recommended':
         posts = recommend(current_user_id, show == 'following' and current_user_id)
     else:  # Default sort is 'new'
@@ -277,6 +314,7 @@ def delete_post(post_id):
     # If all checks pass, proceed with deletion
     db = get_db()
     # To maintain database integrity, delete associated records first
+    db.execute('DELETE FROM help_requests WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM reactions WHERE post_id = ?', (post_id,))
     # Finally, delete the post itself
@@ -424,6 +462,8 @@ def post_detail(post_id):
         AND (u.shadow_banned = 0 OR c.user_id = ?)
         ORDER BY c.created_at ASC
     ''', (post_id, session.get('user_id')))
+
+    current_user_id = session.get('user_id')
     
     comments = [] # Create a new list for the moderated comments
     for comment_raw in comments_raw:
@@ -434,13 +474,89 @@ def post_detail(post_id):
         comment['content'] = moderated_comment_content
         comments.append(comment)
 
+    help_users = [] # Create a list of users to whom the author of the post can send a question.
+    if current_user_id == post['user_id']:
+        help_users = query_db('''
+            SELECT id, username
+            FROM users
+            WHERE id != ? AND shadow_banned = 0
+            ORDER BY username
+        ''', (current_user_id,))
+
+    help_requests = [] # Create a list of asked contributions that only the author of the post and user whos contribution was requested can view.
+    if current_user_id:
+        help_requests = query_db('''
+            SELECT h.id, h.question, h.created_at,
+                   asker.username AS asker_username,
+                   recipient.username AS recipient_username,
+                   h.asker_id, h.recipient_id
+            FROM help_requests h
+            JOIN users asker ON asker.id = h.asker_id
+            JOIN users recipient ON recipient.id = h.recipient_id
+            WHERE h.post_id = ?
+              AND (h.asker_id = ? OR h.recipient_id = ?)
+            ORDER BY h.created_at DESC
+        ''', (post_id, current_user_id, current_user_id))
+
     # Pass the moderated data to the template
     return render_template('post_detail.html.j2',
                            post=post,
                            reactions=reactions,
                            comments=comments,
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           help_users=help_users,
+                           help_requests=help_requests)
+
+@app.route('/leaderboard')
+def leaderboard():
+    # Define the leaderboard window where the user can choose either last 14 days or all time. Users who have been shadow banned will not be included.
+    period = request.args.get('period', '14days')
+    if period not in ('14days', 'all'):
+        period = '14days'
+
+    # Include all activity, or apply the date filter. 
+    date_filter = (
+        "AND {alias}.created_at >= datetime('now', '-14 days')"
+        if period == '14days'
+        else ''
+    )
+
+    # Build the query to database and count the users' score from posts and comments. Post give 10 points, comments 5 points.
+    users = query_db(f'''
+        SELECT
+            u.id,
+            u.username,
+            10 * (
+                SELECT COUNT(*)
+                FROM posts p
+                WHERE p.user_id = u.id
+                  {date_filter.format(alias='p')}
+            ) +
+            5 * (
+                SELECT COUNT(*)
+                FROM comments c
+                WHERE c.user_id = u.id
+                  {date_filter.format(alias='c')}
+            ) AS points,
+            (
+                SELECT COUNT(*)
+                FROM posts p
+                WHERE p.user_id = u.id
+                  {date_filter.format(alias='p')}
+            ) AS post_count,
+            (
+                SELECT COUNT(*)
+                FROM comments c
+                WHERE c.user_id = u.id
+                  {date_filter.format(alias='c')}
+            ) AS comment_count
+        FROM users u
+        WHERE u.shadow_banned = 0
+        ORDER BY points DESC, u.username ASC
+    ''')
+
+    return render_template('leaderboard.html.j2', users=users, current_period=period)
 
 @app.route('/about')
 def about():
@@ -521,6 +637,72 @@ def logout():
     session.clear()
     flash('Logged out.', 'info')
     return redirect(url_for('login'))
+
+@app.route('/posts/<int:post_id>/ask', methods=['POST'])
+def ask_user_for_help(post_id):
+    # A feature where the post's author can ask contribution from a specific user.
+    asker_id = session.get('user_id')
+
+    if not asker_id:
+        flash('You must be logged in to ask a question.', 'danger')
+        return redirect(url_for('login'))
+
+    # Get the post from database.
+    post = query_db(
+        'SELECT user_id FROM posts WHERE id = ?',
+        (post_id,),
+        one=True
+    )
+
+    if not post:
+        abort(404)
+
+    if post['user_id'] != asker_id:
+        flash('Only the post author can ask a question.', 'danger')
+        return redirect(url_for('post_detail', post_id=post_id))
+
+    # The selected recipient id must be valid.
+    try:
+        recipient_id = int(request.form.get('recipient_id', ''))
+    except (TypeError, ValueError):
+        flash('Please select a valid user.', 'warning')
+        return redirect(url_for('post_detail', post_id=post_id))
+
+    question = request.form.get('question', '').strip()
+
+    if not question:
+        flash('Question cannot be empty.', 'warning')
+        return redirect(url_for('post_detail', post_id=post_id))
+
+    moderated_question, _ = moderate_content(question) # Pass the question through moderation function.
+
+    if moderated_question in ('content removed due to severe violation', 'content removed due to spam/scam policy'):
+        # Check that the question does not break the moderation rules.
+        flash('The question could not be sent because it violates the content rules.', 'danger')
+        return redirect(url_for('post_detail', post_id=post_id))
+
+    # The selected recipient must not be assigned with shadow ban. 
+    recipient = query_db('''
+        SELECT id
+        FROM users
+        WHERE id = ? AND shadow_banned = 0
+    ''', (recipient_id,), one=True)
+
+    if not recipient or recipient_id == asker_id or not question:
+        flash('Select another user and enter a question.', 'warning')
+        return redirect(url_for('post_detail', post_id=post_id))
+
+    # Store the question in the database.
+    db = get_db()
+    db.execute('''
+        INSERT INTO help_requests
+            (post_id, asker_id, recipient_id, question)
+        VALUES (?, ?, ?, ?)
+    ''', (post_id, asker_id, recipient_id, moderated_question))
+    db.commit()
+
+    flash('Your question was sent.', 'success')
+    return redirect(url_for('post_detail', post_id=post_id))
 
 @app.route('/posts/<int:post_id>/comment', methods=['POST'])
 def add_comment(post_id):
@@ -888,6 +1070,7 @@ def admin_delete_post(post_id):
         return redirect(url_for('feed'))
 
     db = get_db()
+    db.execute('DELETE FROM help_requests WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM comments WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM reactions WHERE post_id = ?', (post_id,))
     db.execute('DELETE FROM posts WHERE id = ?', (post_id,))

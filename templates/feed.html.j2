@@ -31,6 +31,7 @@
     <!-- The link preserves the current_show state -->
     <a href="{{ url_for('feed', sort='new', show=current_show) }}" class="btn {% if current_sort == 'new' %}btn-primary{% else %}btn-light{% endif %}">New</a>
     <a href="{{ url_for('feed', sort='popular', show=current_show) }}" class="btn {% if current_sort == 'popular' %}btn-primary{% else %}btn-light{% endif %}">Popular</a>
+    <a href="{{ url_for('feed', sort='top_contributors', show=current_show) }}" class="btn {% if current_sort == 'top_contributors' %}btn-primary{% else %}btn-light{% endif %}">Top contributors</a>
     <a href="{{ url_for('feed', sort='recommended', show=current_show) }}" class="btn {% if current_sort == 'recommended' %}btn-primary{% else %}btn-light{% endif %}">Recommended</a>
   </div>
 

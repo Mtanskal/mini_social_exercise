@@ -6,6 +6,72 @@
   <img src="{{ url_for('static', filename='icon.png') }}" alt="Logo" style="height: 64px;" class="mb-4">
 </div>
 
+<div class="col-md-8 mx-auto mb-4">
+  <div class="card shadow-sm">
+    <div class="card-body">
+      <h5 class="card-title">New user introductions</h5>
+
+      {% if can_introduce %}
+      <form action="{{ url_for('add_introduction') }}" method="POST">
+        <textarea class="form-control mb-3" name="content" rows="3"
+                  placeholder="Tell something about yourself" required></textarea>
+        <button type="submit" class="btn btn-primary">Introduce yourself!</button>
+      </form>
+      {% endif %}
+
+      <hr>
+
+      {% if introductions %}
+        {% for introduction in introductions %}
+        <div class="border-bottom py-2">
+          <strong>
+            <a href="{{ url_for('user_profile', username=introduction.username) }}">
+              {{ user_display(introduction.username) }}
+            </a>
+          </strong>
+          <small class="text-muted">{{ introduction.created_at|datetimeformat }}</small>
+          <p class="mb-1">{{ introduction.content }}</p>
+        </div>
+        <div class="d-flex align-items-center mt-2">
+          {% for reaction in introduction.reactions %}
+            <span class="me-2">
+              {{ reaction_emojis.get(reaction.reaction_type, '👍') }} {{ reaction.count }}
+            </span>
+          {% endfor %}
+
+          {% if session.get('user_id') %}
+          <form action="{{ url_for('react_to_introduction', introduction_id=introduction.id) }}"
+                method="POST" class="d-flex align-items-center">
+            <select name="reaction" class="form-select form-select-sm me-2">
+              {% for reaction_type in reaction_types %}
+              <option value="{{ reaction_type }}"
+                {% if introduction.user_reaction == reaction_type %}selected{% endif %}>
+                {{ reaction_type|capitalize }}
+              </option>
+              {% endfor %}
+            </select>
+            <button type="submit" class="btn btn-sm btn-light">React</button>
+          </form>
+          {% endif %}
+        </div>
+        {% endfor %}
+      {% else %}
+        <p class="text-muted mb-0">No introductions yet</p>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% if session.get('user_id') %}
+  {% if reaction_count >= 5 %}
+    {# The entire current "Create a new post" card #}
+  {% else %}
+    <p class="text-center">
+      React to at least five different posts before you can publish a regular post.
+    </p>
+  {% endif %}
+{% endif %}
+
 {% if session.get('user_id') %}
 <div class="col-md-8 mx-auto mb-4">
   <div class="card shadow-sm">
@@ -20,6 +86,14 @@
     </div>
   </div>
 </div>
+{% endif %}
+
+{% if session.get('user_id') %}
+  {% if reaction_count >= 5 %}
+    <!-- Current publication form -->
+  {% else %}
+    <p>You need to react to at least 5 posts before you can publish your own.</p>
+  {% endif %}
 {% endif %}
 
 <h2 class="text-center border-bottom pb-2 mb-4"><span>Posts</span></h2>

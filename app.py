@@ -112,6 +112,67 @@ def feed():
     current_user_id = session.get('user_id')
     params = []
 
+    # Get the introductions from database from oldest to newest.
+    introductions = [dict(row) for row in query_db('''
+        SELECT i.id, i.content, i.created_at, u.username, i.user_id
+        FROM introductions i
+        JOIN users u ON u.id = i.user_id
+        WHERE u.shadow_banned = 0 OR i.user_id = ?
+        ORDER BY i.created_at DESC
+    ''', (current_user_id,))]
+
+    for introduction in introductions:
+        introduction['content'], _ = moderate_content(introduction['content']) # Moderated version of the introduction. 
+        # Get the number of reactions by type. 
+        introduction['reactions'] = query_db(
+            '''SELECT reaction_type, COUNT(*) AS count
+            FROM introduction_reactions
+            WHERE introduction_id = ?
+            GROUP BY reaction_type''',
+            (introduction['id'],)
+        )
+
+        introduction['user_reaction'] = None
+        if current_user_id:
+            row = query_db(
+                '''SELECT reaction_type
+                FROM introduction_reactions
+                WHERE introduction_id = ? AND user_id = ?''',
+                (introduction['id'], current_user_id),
+                one=True
+            )
+            if row:
+                introduction['user_reaction'] = row['reaction_type']
+
+    can_introduce = False # Can the user introduce or not
+
+    if current_user_id:
+        # If the user has any normal posts already.
+        post_count = query_db(
+            'SELECT COUNT(*) AS count FROM posts WHERE user_id = ?',
+            (current_user_id,),
+            one=True
+        )['count']
+
+        # If the user has already introduced.
+        existing_introduction = query_db(
+            'SELECT 1 FROM introductions WHERE user_id = ?',
+            (current_user_id,),
+            one=True
+        )
+
+        can_introduce = post_count == 0 and existing_introduction is None
+
+    reaction_count = 0 # How many different posts the user has reacted to.
+    if current_user_id:
+        # Count how many different posts the user has reacted to. 
+        row = query_db(
+            'SELECT COUNT(DISTINCT post_id) AS count FROM reactions WHERE user_id = ?',
+            (current_user_id,),
+            one=True
+        )
+        reaction_count = row['count']
+
     #  2. Build the Query 
     where_clause = "WHERE (u.shadow_banned = 0 OR p.user_id = ?)"
     params.append(current_user_id)
@@ -245,7 +306,91 @@ def feed():
                            page=page, # Pass current page number
                            per_page=POSTS_PER_PAGE, # Pass items per page
                            reaction_emojis=REACTION_EMOJIS,
-                           reaction_types=REACTION_TYPES)
+                           reaction_types=REACTION_TYPES,
+                           introductions=introductions,
+                           can_introduce=can_introduce,
+                           reaction_count=reaction_count) # Need to have reacted to atleast 5 posts
+
+@app.route('/introductions', methods=['POST'])
+def add_introduction():
+    # Handles the introductions on the feed.
+    user_id = session.get('user_id')
+
+    if not user_id:
+        flash('Log in to introduce yourself.', 'danger')
+        return redirect(url_for('login'))
+
+    # How many posts the user has made.
+    post_count = query_db(
+        'SELECT COUNT(*) AS count FROM posts WHERE user_id = ?',
+        (user_id,),
+        one=True
+    )['count']
+
+    if post_count > 0:
+        flash('The introduction thread is intended for users who have not yet posted.', 'warning')
+        return redirect(url_for('feed'))
+
+    content = request.form.get('content', '').strip()
+    moderated_content, _ = moderate_content(content) # Moderated version of the introduction.
+
+    if moderated_content == 'content removed due to spam/scam policy':
+        query_db(
+            'UPDATE users SET shadow_banned = 1 WHERE id = ?',
+            (user_id,),
+            commit=True
+        )
+        flash('content removed due to spam/scam policy', 'warning')
+        return redirect(url_for('feed'))
+
+    if (not moderated_content or not moderated_content.strip() or moderated_content == 'content removed due to severe violation'):
+        flash('The introduction was empty or was removed due to moderation.', 'warning')
+        return redirect(url_for('feed'))
+
+    try:
+        query_db(
+            'INSERT INTO introductions (user_id, content) VALUES (?, ?)',
+            (user_id, moderated_content),
+            commit=True
+        )
+        flash('Your introduction has been published.', 'success')
+    except sqlite3.IntegrityError:
+        flash('You have already published an introduction.', 'info')
+
+    return redirect(url_for('feed'))
+
+@app.route('/introductions/<int:introduction_id>/react', methods=['POST'])
+def react_to_introduction(introduction_id):
+    # Handles the reactions to introductions on the feed.
+    user_id = session.get('user_id')
+    if not user_id:
+        flash('You must be logged in to react.', 'danger')
+        return redirect(url_for('login'))
+
+    reaction_type = request.form.get('reaction')
+    if reaction_type not in REACTION_TYPES:
+        flash('Invalid reaction.', 'warning')
+        return redirect(url_for('feed'))
+
+    introduction = query_db(
+        'SELECT id FROM introductions WHERE id = ?',
+        (introduction_id,),
+        one=True
+    )
+    if not introduction:
+        flash('Introduction not found.', 'warning')
+        return redirect(url_for('feed'))
+
+    db = get_db()
+    db.execute('''
+        INSERT INTO introduction_reactions (introduction_id, user_id, reaction_type)
+        VALUES (?, ?, ?)
+        ON CONFLICT(introduction_id, user_id)
+        DO UPDATE SET reaction_type = excluded.reaction_type
+    ''', (introduction_id, user_id, reaction_type))
+    db.commit()
+
+    return redirect(request.referrer or url_for('feed'))
 
 @app.route('/posts/new', methods=['POST'])
 def add_post():
@@ -256,6 +401,16 @@ def add_post():
     if not user_id:
         flash('You must be logged in to create a post.', 'danger')
         return redirect(url_for('login'))
+
+    row = query_db(
+        'SELECT COUNT(DISTINCT post_id) AS count FROM reactions WHERE user_id = ?',
+        (user_id,),
+        one=True
+    )
+    # Requirement to react to at least five posts before the user can post anything.
+    if row['count'] < 5:
+        flash('React to at least five different posts before publishing.', 'warning')
+        return redirect(url_for('feed'))
 
     # Get content from the submitted form
     content = request.form.get('content')
@@ -1305,11 +1460,101 @@ def recommend(user_id, filter_following):
     - https://www.nvidia.com/en-us/glossary/recommendation-system/
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
-    """
+   
 
     recommended_posts = {} 
 
-    return recommended_posts;
+    return recommended_posts;"""
+
+    # Check the validity of user id.
+    if not user_id:
+        return []
+
+    # Collect all positive reactions that user has made and their posts.
+    positive_reactions = query_db('''
+        SELECT p.content
+        FROM reactions r
+        JOIN posts p ON p.id = r.post_id
+        WHERE r.user_id = ?
+          AND r.reaction_type IN ('like', 'love', 'laugh')
+    ''', (user_id,))
+
+    # Filter "stop" words 
+    stop_words = {
+        'the', 'and', 'for', 'that', 'this', 'with', 'you', 'are',
+        'was', 'have', 'from', 'but', 'not', 'just', 'your'
+    }
+
+    interest_words = {} # The user's interst words
+
+    # Go through the entire post's text and count how many times a given word appears in it. Based on the word's appear count, give the word a score. For example 5 appreances in a post -> score of 5.
+    texts = [row['content'] for row in positive_reactions]
+
+    for text in texts:
+        for word in text.lower().split():
+            word = word.strip(".,!?;:()[]{}\"'")
+            if len(word) >= 3 and word not in stop_words:
+                interest_words[word] = interest_words.get(word, 0) + 1
+
+    # If the user has no positive reactions, show the first 5 posts from database search from oldest to newest
+    placeholders = ''
+    params = [user_id]
+
+    # Filter the recommendations based on if the recommendations are from users followers or everyone.
+    if filter_following:
+        following_ids = query_db(
+            'SELECT followed_id FROM follows WHERE follower_id = ?',
+            (user_id,)
+        )
+        following_ids = [row['followed_id'] for row in following_ids]
+
+        if not following_ids:
+            return []
+
+        placeholders = ','.join('?' for _ in following_ids)
+
+    query = '''
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.user_id != ?
+          AND u.shadow_banned = 0
+          AND NOT EXISTS (
+              SELECT 1 FROM reactions r
+              WHERE r.post_id = p.id AND r.user_id = ?
+          )
+    '''
+    params.append(user_id)
+
+    if filter_following:
+        query += f' AND p.user_id IN ({placeholders})'
+        params.extend(following_ids)
+
+    candidates = query_db(query, params) # The canditate posts.
+
+    # Scores the candidate posts by increasing that post's score up by a given interest word’s score if that interest word appears in the post.
+    def score(post):
+        content_words = {
+            word.strip(".,!?;:()[]{}\"'").lower()
+            for word in post['content'].split()
+        }
+        return sum(
+            count for word, count in interest_words.items()
+            if word in content_words
+        )
+
+    # Select only five words that have the highest score from oldest to newest. 
+    candidates.sort(
+        key=lambda post: score(post),
+        reverse=True
+    )
+    recommended_posts = candidates[:5]
+    recommended_posts.sort(
+        key=lambda post: post['created_at'],
+        reverse=True
+    )
+
+    return recommended_posts
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
